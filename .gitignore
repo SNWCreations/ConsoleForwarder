@@ -1,0 +1,44 @@
+# Build directories
+build/
+build32/
+out/
+cmake-build-*/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Workspace reference files (not part of the project)
+workspace/
