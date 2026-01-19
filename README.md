@@ -2,6 +2,33 @@
 
 A Windows utility that captures console output from programs that create their own console window (like Valve's Source Engine Dedicated Server) and forwards it to standard output/error streams.
 
+## Why This Tool?
+
+Some Windows programs, notably Valve's Source Engine Dedicated Server (`srcds.exe`), don't write their output to standard streams (stdout/stderr). Instead, they:
+
+1. Create their own console window using `AllocConsole()`
+2. Write directly to the console using `WriteFile()` or `WriteConsole()`
+
+This means **normal output redirection doesn't work**:
+
+```cmd
+# This captures NOTHING - srcds output goes to its own console window, not stdout
+srcds.exe -game tf +map cp_dustbowl > server.log 2>&1
+```
+
+This is a problem when you want to:
+- **Run srcds as a background service** and collect logs
+- **Monitor server output** from a process manager (systemd, Docker, PM2, etc.)
+- **Pipe output** to log aggregation tools
+- **Run headless** without a visible console window
+
+ConsoleForwarder solves this by intercepting the console output and forwarding it to standard streams:
+
+```cmd
+# This works - output is captured to server.log
+ConsoleForwarder --mode inject srcds.exe -game tf +map cp_dustbowl > server.log 2>&1
+```
+
 ## Features
 
 - Captures output from programs that use `AllocConsole()` and write directly to the console
