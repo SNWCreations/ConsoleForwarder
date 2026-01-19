@@ -166,25 +166,16 @@ static void ReadConsoleBuffer(HANDLE hConsole, ConsoleState& state, HANDLE hStdo
 
 static std::atomic<bool> g_LegacyRunning{true};
 
-static void StdinForwardThread(DWORD targetPid) {
-    // Attach to target process's console to send input
-    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    char buffer[256];
-    DWORD bytesRead;
-
-    while (g_LegacyRunning) {
-        if (!ReadFile(hStdin, buffer, sizeof(buffer), &bytesRead, nullptr) || bytesRead == 0) {
-            break;
-        }
-
-        // We need to attach to the target console to send input
-        // This is complex - for now we'll skip stdin forwarding in legacy mode
-        // The inject mode handles this better
-    }
-}
-
 void RunLegacyLoop(LegacyConsoleHandle& handle) {
+    // Save stdout handle before detaching - if we're running from a terminal,
+    // the handle remains valid even after FreeConsole()
+    // But if we're a GUI subsystem or stdin is redirected, we need to handle differently
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    // Check if stdout is a valid handle (pipe or file, not console)
+    DWORD stdoutType = GetFileType(hStdout);
+    bool stdoutIsPipe = (stdoutType == FILE_TYPE_PIPE || stdoutType == FILE_TYPE_DISK);
+
     ConsoleState state;
     g_LegacyRunning = true;
 
@@ -197,30 +188,69 @@ void RunLegacyLoop(LegacyConsoleHandle& handle) {
 
     // Attach to target's console
     if (!AttachConsole(targetPid)) {
-        fwprintf(stderr, L"Failed to attach to target console: %lu\n", GetLastError());
-        // Re-allocate our console
+        DWORD err = GetLastError();
+        // Re-allocate our console to show error
         AllocConsole();
+        fwprintf(stderr, L"Failed to attach to target console: %lu\n", err);
         return;
     }
 
-    HANDLE hTargetConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    // Get handle to target's console output buffer
+    HANDLE hTargetConsole = CreateFileW(
+        L"CONOUT$",
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr
+    );
+
+    if (hTargetConsole == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        FreeConsole();
+        AllocConsole();
+        fwprintf(stderr, L"Failed to open target console buffer: %lu\n", err);
+        return;
+    }
+
+    // If stdout was a console (not pipe/file), we need to write to a file or use a different method
+    // For now, if stdout is not a pipe, we'll write to a temp file or just skip
+    HANDLE hOutput = hStdout;
+    if (!stdoutIsPipe) {
+        // stdout was a console handle, it's now invalid
+        // We can't output anywhere useful in this case
+        // This is a limitation of legacy mode when not run with redirected output
+        hOutput = INVALID_HANDLE_VALUE;
+    }
 
     // Main loop - poll console buffer for changes
     while (handle.running) {
         DWORD exitCode;
         if (!GetExitCodeProcess(handle.hProcess, &exitCode) || exitCode != STILL_ACTIVE) {
             // Process exited, read any remaining output
-            ReadConsoleBuffer(hTargetConsole, state, hStdout);
+            if (hOutput != INVALID_HANDLE_VALUE) {
+                ReadConsoleBuffer(hTargetConsole, state, hOutput);
+            }
             break;
         }
 
-        ReadConsoleBuffer(hTargetConsole, state, hStdout);
+        if (hOutput != INVALID_HANDLE_VALUE) {
+            ReadConsoleBuffer(hTargetConsole, state, hOutput);
+        }
         Sleep(50); // Poll every 50ms
     }
 
     g_LegacyRunning = false;
 
+    CloseHandle(hTargetConsole);
+
     // Detach and re-allocate our console
     FreeConsole();
     AllocConsole();
+
+    if (!stdoutIsPipe) {
+        fwprintf(stderr, L"Warning: Legacy mode output was not captured (stdout was not redirected)\n");
+        fwprintf(stderr, L"Use --mode inject for better results, or redirect output to a file\n");
+    }
 }
