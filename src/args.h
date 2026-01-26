@@ -10,10 +10,17 @@ enum class CaptureMode {
     Inject      // Use DLL injection
 };
 
+enum class StdinMode {
+    Auto,       // Auto-detect: enable if stdin is a terminal
+    ForceOn,    // Always enable stdin forwarding
+    ForceOff    // Always disable stdin forwarding
+};
+
 struct LaunchOptions {
     std::wstring program;
     std::vector<std::wstring> args;
     CaptureMode mode = CaptureMode::Auto;
+    StdinMode stdinMode = StdinMode::Auto;
     bool hideWindow = false;
     bool showHelp = false;
 };

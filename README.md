@@ -1,10 +1,10 @@
 # ConsoleForwarder
 
-A Windows utility that captures console output from programs that create their own console window (like Valve's Source Engine Dedicated Server) and forwards it to standard output/error streams.
+A Windows utility that captures console output from programs that create their own console window (like Valve's Source Engine Dedicated Server or Unreal Engine dedicated servers) and forwards it to standard output/error streams.
 
 ## Why This Tool?
 
-Some Windows programs, notably Valve's Source Engine Dedicated Server (`srcds.exe`), don't write their output to standard streams (stdout/stderr). Instead, they:
+Some Windows programs, notably Valve's Source Engine Dedicated Server (`srcds.exe`) and Unreal Engine dedicated servers (like Satisfactory), don't write their output to standard streams (stdout/stderr). Instead, they:
 
 1. Create their own console window using `AllocConsole()`
 2. Write directly to the console using `WriteFile()` or `WriteConsole()`
@@ -17,7 +17,7 @@ srcds.exe -game tf +map cp_dustbowl > server.log 2>&1
 ```
 
 This is a problem when you want to:
-- **Run srcds as a background service** and collect logs
+- **Run servers as a background service** and collect logs
 - **Monitor server output** from a process manager (systemd, Docker, PM2, etc.)
 - **Pipe output** to log aggregation tools
 - **Run headless** without a visible console window
@@ -33,12 +33,14 @@ ConsoleForwarder --mode inject srcds.exe -game tf +map cp_dustbowl > server.log 
 
 - Captures output from programs that use `AllocConsole()` and write directly to the console
 - Multiple capture methods: ConPTY, Legacy console buffer reading, and DLL injection
+- Supports ANSI escape sequences (colors, cursor positioning, etc.)
 - Supports command-line arguments and argument files (`@argfile` syntax like JVM)
-- Forwards stdin to the child process (injection mode)
+- Forwards stdin to the child process (configurable)
 - Separates stdout and stderr streams (injection mode)
 - Option to hide the child process console window
 - Graceful shutdown handling:
   - Source Engine programs: sends "quit" command automatically
+  - ConPTY mode: forwards Ctrl+C to child process
   - Other programs: sends WM_CLOSE to console window
 - Supports both 32-bit and 64-bit targets
 
@@ -95,6 +97,12 @@ ConsoleForwarder [options] <program> [program arguments...]
 | `--mode <mode>` | Capture mode: `auto`, `conpty`, `legacy`, `inject` (default: `auto`) |
 | `--hide` | Hide the child process console window |
 | `--show` | Show the child process console window (default) |
+| `--stdin` | Force enable stdin forwarding to child process |
+| `--no-stdin` | Force disable stdin forwarding (useful for servers that don't accept input) |
+
+By default, stdin forwarding is automatically enabled when running interactively (stdin is a terminal) and disabled when stdin is redirected (e.g., from a pipe or file).
+
+**Note**: The auto-detection only checks whether ConsoleForwarder's stdin is a terminal -- it cannot detect whether the target process actually reads console input. For programs that don't accept input (like some game servers), use `--no-stdin` explicitly.
 
 ### Argument File
 
@@ -133,6 +141,16 @@ Using injection mode with hidden window:
 ConsoleForwarder --mode inject --hide srcds.exe -game tf
 ```
 
+Using ConPTY mode for Unreal Engine servers (like Satisfactory):
+```cmd
+ConsoleForwarder --mode conpty FactoryServer-Win64-Shipping-Cmd.exe
+```
+
+Disable stdin for servers that don't accept console input:
+```cmd
+ConsoleForwarder --mode conpty --no-stdin FactoryServer.exe
+```
+
 Using argument file:
 ```cmd
 ConsoleForwarder srcds.exe @server_args.txt
@@ -153,6 +171,11 @@ Run from PowerShell or cmd (output appears in terminal):
 ### ConPTY Mode (Win10 1809+)
 
 Uses the Windows Pseudo Console API to create a virtual terminal. The child process is started with the pseudo console attached, and all console output is captured through a pipe.
+
+Features:
+- Full ANSI escape sequence support (colors, cursor positioning, etc.)
+- Ctrl+C is forwarded to the child process for graceful shutdown
+- Stdin forwarding is configurable (auto-detected by default)
 
 ### Legacy Mode
 
@@ -178,12 +201,21 @@ When the launcher receives a termination signal (Ctrl+C, window close, etc.):
 
 The launcher then waits for the target process to exit before terminating.
 
-## Use Case
+## Use Cases
 
-This tool is designed for programs like Valve's Source Engine Dedicated Server (`srcds.exe`) that:
-1. Call `AllocConsole()` to create their own console window
-2. Write output using `WriteFile()` or `WriteConsole()` directly
-3. Don't use standard stdout/stderr streams
+This tool is designed for programs like:
+
+### Valve Source Engine Dedicated Servers (`srcds.exe`)
+- Call `AllocConsole()` to create their own console window
+- Write output using `WriteFile()` or `WriteConsole()` directly
+- Don't use standard stdout/stderr streams
+- **Recommended mode**: `inject`
+
+### Unreal Engine Dedicated Servers (Satisfactory, etc.)
+- Use their own console output mechanisms
+- Support ANSI escape sequences for colored output
+- Often do not accept console input (stdin is ignored)
+- **Recommended mode**: `conpty --no-stdin`
 
 These programs cannot be captured using normal pipe redirection. ConsoleForwarder solves this by intercepting the console output at various levels.
 

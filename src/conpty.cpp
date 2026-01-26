@@ -193,6 +193,36 @@ bool CreateConPTYProcess(
 }
 
 static std::atomic<bool> g_Running{true};
+static HANDLE g_hPipeIn = INVALID_HANDLE_VALUE;
+static HANDLE g_hProcess = nullptr;
+static HPCON g_hPC = nullptr;
+
+static BOOL WINAPI ConPTYCtrlHandler(DWORD ctrlType) {
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+        // Send Ctrl+C character to the pseudo console input
+        if (g_hPipeIn != INVALID_HANDLE_VALUE) {
+            char ctrlC = '\x03';
+            DWORD written;
+            WriteFile(g_hPipeIn, &ctrlC, 1, &written, nullptr);
+        }
+        return TRUE;  // Signal handled, don't terminate launcher
+    }
+
+    if (ctrlType == CTRL_CLOSE_EVENT || ctrlType == CTRL_LOGOFF_EVENT || ctrlType == CTRL_SHUTDOWN_EVENT) {
+        // For close/logoff/shutdown, close the pseudo console to signal the child
+        if (g_hPC && pClosePseudoConsole) {
+            pClosePseudoConsole(g_hPC);
+            g_hPC = nullptr;
+        }
+        // Wait for process to exit
+        if (g_hProcess) {
+            WaitForSingleObject(g_hProcess, 5000);
+        }
+        return TRUE;
+    }
+
+    return FALSE;
+}
 
 static void StdinReaderThread(HANDLE hPipeIn) {
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
@@ -210,32 +240,111 @@ static void StdinReaderThread(HANDLE hPipeIn) {
     }
 }
 
-void RunConPTYLoop(ConPTYHandle& handle) {
+static bool ShouldEnableStdin(StdinMode mode) {
+    if (mode == StdinMode::ForceOn) return true;
+    if (mode == StdinMode::ForceOff) return false;
+
+    // Auto mode: check if stdin is a terminal
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    if (hStdin == INVALID_HANDLE_VALUE) return false;
+
+    // Check if it's a console handle
+    DWORD consoleMode;
+    return GetConsoleMode(hStdin, &consoleMode) != 0;
+}
+
+void RunConPTYLoop(ConPTYHandle& handle, StdinMode stdinMode) {
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
     char buffer[4096];
     DWORD bytesRead;
 
-    // Start stdin reader thread
-    std::thread stdinThread(StdinReaderThread, handle.hPipeIn);
+    // Store handles for console control handler
+    g_hPipeIn = handle.hPipeIn;
+    g_hProcess = handle.hProcess;
+    g_hPC = handle.hPC;
+
+    // Register console control handler
+    SetConsoleCtrlHandler(ConPTYCtrlHandler, TRUE);
+
+    // Start stdin reader thread only if needed
+    bool enableStdin = ShouldEnableStdin(stdinMode);
+    std::thread stdinThread;
+    if (enableStdin) {
+        stdinThread = std::thread(StdinReaderThread, handle.hPipeIn);
+    }
 
     // Read from pseudo console and write to stdout
+    // Use overlapped I/O to allow checking if process has exited
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
     while (true) {
-        if (!ReadFile(handle.hPipeOut, buffer, sizeof(buffer), &bytesRead, nullptr) || bytesRead == 0) {
+        // Check if process has exited
+        DWORD waitResult = WaitForSingleObject(handle.hProcess, 0);
+        if (waitResult == WAIT_OBJECT_0) {
+            // Process exited, drain remaining output then exit
+            DWORD available = 0;
+            while (PeekNamedPipe(handle.hPipeOut, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+                if (ReadFile(handle.hPipeOut, buffer, min((DWORD)sizeof(buffer), available), &bytesRead, nullptr) && bytesRead > 0) {
+                    DWORD bytesWritten;
+                    WriteFile(hStdout, buffer, bytesRead, &bytesWritten, nullptr);
+                } else {
+                    break;
+                }
+            }
             break;
         }
-        DWORD bytesWritten;
-        WriteFile(hStdout, buffer, bytesRead, &bytesWritten, nullptr);
+
+        // Try to read with a short timeout by peeking first
+        DWORD available = 0;
+        if (!PeekNamedPipe(handle.hPipeOut, nullptr, 0, nullptr, &available, nullptr)) {
+            break;
+        }
+
+        if (available > 0) {
+            if (!ReadFile(handle.hPipeOut, buffer, min((DWORD)sizeof(buffer), available), &bytesRead, nullptr) || bytesRead == 0) {
+                break;
+            }
+            DWORD bytesWritten;
+            WriteFile(hStdout, buffer, bytesRead, &bytesWritten, nullptr);
+        } else {
+            // No data available, sleep briefly to avoid busy loop
+            Sleep(10);
+        }
     }
+
+    CloseHandle(ov.hEvent);
 
     g_Running = false;
 
-    // Cancel stdin read if blocked
-    CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), nullptr);
+    // Close the pseudo console to terminate conhost.exe
+    if (handle.hPC && pClosePseudoConsole) {
+        pClosePseudoConsole(handle.hPC);
+        handle.hPC = nullptr;
+        g_hPC = nullptr;
+    }
 
-    if (stdinThread.joinable()) {
-        stdinThread.join();
+    // Close the input pipe to unblock stdin thread's WriteFile
+    if (handle.hPipeIn != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle.hPipeIn);
+        handle.hPipeIn = INVALID_HANDLE_VALUE;
+        g_hPipeIn = INVALID_HANDLE_VALUE;
+    }
+
+    // Cancel stdin read if blocked and join thread
+    if (enableStdin) {
+        CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), nullptr);
+        if (stdinThread.joinable()) {
+            stdinThread.join();
+        }
     }
 
     // Wait for process to exit
     WaitForSingleObject(handle.hProcess, INFINITE);
+
+    // Cleanup
+    SetConsoleCtrlHandler(ConPTYCtrlHandler, FALSE);
+    g_hPipeIn = INVALID_HANDLE_VALUE;
+    g_hProcess = nullptr;
+    g_hPC = nullptr;
 }

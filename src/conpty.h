@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include "args.h"
 
 bool IsConPTYAvailable();
 
@@ -23,4 +24,4 @@ bool CreateConPTYProcess(
     ConPTYHandle& handle
 );
 
-void RunConPTYLoop(ConPTYHandle& handle);
+void RunConPTYLoop(ConPTYHandle& handle, StdinMode stdinMode);

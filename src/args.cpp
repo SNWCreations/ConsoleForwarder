@@ -92,6 +92,10 @@ bool ParseArguments(int argc, wchar_t* argv[], LaunchOptions& options) {
                 options.hideWindow = true;
             } else if (arg == L"--show") {
                 options.hideWindow = false;
+            } else if (arg == L"--stdin") {
+                options.stdinMode = StdinMode::ForceOn;
+            } else if (arg == L"--no-stdin") {
+                options.stdinMode = StdinMode::ForceOff;
             } else if (arg[0] == L'-') {
                 fwprintf(stderr, L"Error: Unknown option '%s'\n", arg.c_str());
                 return false;
@@ -119,6 +123,8 @@ void PrintUsage(const wchar_t* programName) {
     wprintf(L"  --mode <mode>    Capture mode: auto, conpty, legacy, inject (default: auto)\n");
     wprintf(L"  --hide           Hide the child process console window\n");
     wprintf(L"  --show           Show the child process console window (default)\n");
+    wprintf(L"  --stdin          Force enable stdin forwarding to child process\n");
+    wprintf(L"  --no-stdin       Force disable stdin forwarding to child process\n");
     wprintf(L"\nArgument file:\n");
     wprintf(L"  Use @filename to read arguments from a file (one per line)\n");
     wprintf(L"\nModes:\n");
@@ -126,7 +132,11 @@ void PrintUsage(const wchar_t* programName) {
     wprintf(L"  conpty  - Use Windows Pseudo Console (requires Win10 1809+)\n");
     wprintf(L"  legacy  - Use console buffer reading (works on older Windows)\n");
     wprintf(L"  inject  - Use DLL injection to hook WriteConsole\n");
+    wprintf(L"\nStdin forwarding:\n");
+    wprintf(L"  By default, stdin is forwarded only when it is a terminal.\n");
+    wprintf(L"  Use --stdin or --no-stdin to override this behavior.\n");
     wprintf(L"\nExamples:\n");
     wprintf(L"  %s srcds.exe -game tf +maxplayers 24\n", programName);
     wprintf(L"  %s --mode inject --hide srcds.exe @server_args.txt\n", programName);
+    wprintf(L"  %s --mode conpty --no-stdin FactoryServer.exe\n", programName);
 }

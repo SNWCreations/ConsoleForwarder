@@ -32,10 +32,24 @@ static CaptureMode SelectBestMode(CaptureMode requested) {
     return CaptureMode::Inject;
 }
 
+static void EnableVirtualTerminalProcessing() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return;
+
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) return;
+
+    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hOut, mode);
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     // Set console to UTF-8
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+
+    // Enable ANSI escape sequence processing
+    EnableVirtualTerminalProcessing();
 
     LaunchOptions options;
     if (!ParseArguments(argc, argv, options)) {
@@ -56,7 +70,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (!CreateConPTYProcess(options.program, options.args, options.hideWindow, handle)) {
             return 1;
         }
-        RunConPTYLoop(handle);
+        RunConPTYLoop(handle, options.stdinMode);
 
         DWORD exitCode = 0;
         GetExitCodeProcess(handle.hProcess, &exitCode);
