@@ -39,30 +39,50 @@ echo Clean complete.
 exit /b 0
 
 :check_requirements
+:: First try cmake in PATH
 where cmake >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: CMake not found in PATH.
-    echo.
-    echo Please install CMake or Visual Studio with C++ workload.
-    exit /b 1
+if not errorlevel 1 (
+    set "CMAKE_CMD=cmake"
+    goto :check_compiler
+)
+
+:: Try Visual Studio's CMake
+for %%V in (2022 2019) do (
+    for %%E in (Community Professional Enterprise) do (
+        set "TEST_PATH=C:\Program Files\Microsoft Visual Studio\%%V\%%E\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+        if exist "!TEST_PATH!" (
+            set "CMAKE_CMD=!TEST_PATH!"
+            goto :check_compiler
+        )
+    )
+)
+
+echo ERROR: CMake not found.
+echo.
+echo Please install one of the following:
+echo   - CMake (https://cmake.org/download/)
+echo   - Visual Studio with C++ workload
+exit /b 1
+
+:check_compiler
+where cl >nul 2>&1
+if not errorlevel 1 exit /b 0
+
+:: Try to set up Visual Studio environment
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "!VSWHERE!" (
+    for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_PATH=%%i"
+)
+if defined VS_PATH (
+    if exist "!VS_PATH!\VC\Auxiliary\Build\vcvarsall.bat" (
+        echo Setting up Visual Studio environment...
+        call "!VS_PATH!\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
+    )
 )
 where cl >nul 2>&1
 if errorlevel 1 (
-    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-    if exist "!VSWHERE!" (
-        for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_PATH=%%i"
-    )
-    if defined VS_PATH (
-        if exist "!VS_PATH!\VC\Auxiliary\Build\vcvarsall.bat" (
-            echo Setting up Visual Studio environment...
-            call "!VS_PATH!\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
-        )
-    )
-    where cl >nul 2>&1
-    if errorlevel 1 (
-        echo ERROR: Visual Studio C++ compiler not found.
-        exit /b 1
-    )
+    echo ERROR: Visual Studio C++ compiler not found.
+    exit /b 1
 )
 exit /b 0
 
@@ -80,19 +100,19 @@ echo.
 
 echo === Building 64-bit ===
 if not exist "build" (
-    cmake -B build -G "Visual Studio 17 2022" -A x64
+    "!CMAKE_CMD!" -B build -G "Visual Studio 17 2022" -A x64
     if errorlevel 1 exit /b 1
 )
-cmake --build build --config %BUILD_CONFIG%
+"!CMAKE_CMD!" --build build --config %BUILD_CONFIG%
 if errorlevel 1 exit /b 1
 echo.
 
 echo === Building 32-bit ===
 if not exist "build32" (
-    cmake -B build32 -G "Visual Studio 17 2022" -A Win32
+    "!CMAKE_CMD!" -B build32 -G "Visual Studio 17 2022" -A Win32
     if errorlevel 1 exit /b 1
 )
-cmake --build build32 --config %BUILD_CONFIG%
+"!CMAKE_CMD!" --build build32 --config %BUILD_CONFIG%
 if errorlevel 1 exit /b 1
 echo.
 
@@ -105,10 +125,10 @@ goto end
 echo Building ConsoleForwarder [%BUILD_CONFIG%] [x64]...
 echo.
 if not exist "build" (
-    cmake -B build -G "Visual Studio 17 2022" -A x64
+    "!CMAKE_CMD!" -B build -G "Visual Studio 17 2022" -A x64
     if errorlevel 1 exit /b 1
 )
-cmake --build build --config %BUILD_CONFIG%
+"!CMAKE_CMD!" --build build --config %BUILD_CONFIG%
 if errorlevel 1 exit /b 1
 echo.
 echo Build successful. Output: build\%BUILD_CONFIG%\
@@ -118,10 +138,10 @@ goto end
 echo Building ConsoleForwarder [%BUILD_CONFIG%] [x86]...
 echo.
 if not exist "build32" (
-    cmake -B build32 -G "Visual Studio 17 2022" -A Win32
+    "!CMAKE_CMD!" -B build32 -G "Visual Studio 17 2022" -A Win32
     if errorlevel 1 exit /b 1
 )
-cmake --build build32 --config %BUILD_CONFIG%
+"!CMAKE_CMD!" --build build32 --config %BUILD_CONFIG%
 if errorlevel 1 exit /b 1
 echo.
 echo Build successful. Output: build32\%BUILD_CONFIG%\
