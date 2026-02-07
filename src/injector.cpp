@@ -1,4 +1,5 @@
 #include "injector.h"
+#include <shellapi.h>
 #include <thread>
 #include <atomic>
 
@@ -270,6 +271,84 @@ bool CreateInjectedProcess(
     return true;
 }
 
+// Deserialize icon from byte buffer received from pipe.
+// See SendIconToPipe() in console_hook.cpp for the serialization format.
+//
+// Icon Serialization Format (all integers are 4 bytes, little-endian):
+// +--------+--------+-----+----------+----------+-----------+----------+------------+-----------+
+// | width  | height | bpp | xHotspot | yHotspot | colorSize | maskSize | colorBits  | maskBits  |
+// | (4B)   | (4B)   | (4B)| (4B)     | (4B)     | (4B)      | (4B)     | (variable) | (variable)|
+// +--------+--------+-----+----------+----------+-----------+----------+------------+-----------+
+//
+// Reconstruction process:
+// 1. Parse header to get dimensions and bitmap sizes
+// 2. Create color bitmap using CreateDIBSection (top-down DIB for correct orientation)
+// 3. Create mask bitmap using CreateBitmap (1bpp monochrome)
+// 4. Combine into HICON using CreateIconIndirect
+static HICON DeserializeIcon(const char* data, DWORD size) {
+    const int headerSize = 7 * sizeof(int);
+    if (size < (DWORD)headerSize) return nullptr;
+
+    const int* header = reinterpret_cast<const int*>(data);
+    int width = header[0];
+    int height = header[1];
+    int bpp = header[2];
+    // int xHotspot = header[3];  // Not used for icons
+    // int yHotspot = header[4];  // Not used for icons
+    int colorSize = header[5];
+    int maskSize = header[6];
+
+    if (size < (DWORD)(headerSize + colorSize + maskSize)) return nullptr;
+    if (width <= 0 || height <= 0 || width > 256 || height > 256) return nullptr;
+
+    const char* colorBits = data + headerSize;
+    const char* maskBits = data + headerSize + colorSize;
+
+    // Create bitmaps from raw bits
+    HDC hdc = GetDC(nullptr);
+    HBITMAP hbmColor = nullptr;
+    HBITMAP hbmMask = nullptr;
+
+    if (colorSize > 0) {
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height;  // Top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = (WORD)bpp;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = nullptr;
+        hbmColor = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (hbmColor && bits) {
+            memcpy(bits, colorBits, colorSize);
+        }
+    }
+
+    if (maskSize > 0) {
+        hbmMask = CreateBitmap(width, height, 1, 1, maskBits);
+    } else {
+        // Create empty mask if none provided
+        hbmMask = CreateBitmap(width, height, 1, 1, nullptr);
+    }
+
+    ReleaseDC(nullptr, hdc);
+
+    if (!hbmColor && !hbmMask) return nullptr;
+
+    ICONINFO iconInfo = {};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmColor = hbmColor;
+    iconInfo.hbmMask = hbmMask;
+
+    HICON hIcon = CreateIconIndirect(&iconInfo);
+
+    if (hbmColor) DeleteObject(hbmColor);
+    if (hbmMask) DeleteObject(hbmMask);
+
+    return hIcon;
+}
+
 static void StdinForwardThread(HANDLE hPipe) {
     DebugLog("StdinForwardThread: Starting\n");
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
@@ -384,6 +463,17 @@ void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::w
     // Store input pipe handle for console control handler (to send quit command)
     g_hPipeIn = hPipeIn;
 
+    // Set initial console icon from target executable
+    HWND hConsoleWnd = GetConsoleWindow();
+    if (hConsoleWnd) {
+        HICON hIcon = ExtractIconW(nullptr, program.c_str(), 0);
+        if (hIcon && hIcon != (HICON)1) {
+            SendMessageW(hConsoleWnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+            SendMessageW(hConsoleWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+            DebugLog("RunInjectedLoop: Set initial console icon from target executable\n");
+        }
+    }
+
     DebugLog("RunInjectedLoop: Starting read loop\n");
 
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -409,6 +499,8 @@ void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::w
     const char MSG_STDERR = 0x02;
     const char MSG_STATUSLINE = 0x03;
     const char MSG_STATUSLINE_ATTR = 0x04;
+    const char MSG_TITLE = 0x05;
+    const char MSG_ICON = 0x06;
 
     // Status line attribute (default: bright green on white, like srcds)
     WORD statusLineAttrib = FOREGROUND_GREEN | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY;
@@ -480,6 +572,22 @@ void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::w
                     attribs[i] = statusLineAttrib;
                 }
                 WriteConsoleOutputAttribute(hStdout, attribs, 80, coord, &written);
+            }
+        } else if (msgType == MSG_TITLE) {
+            // Title change: update launcher console title
+            buffer[totalRead] = '\0';
+            SetConsoleTitleA(buffer);
+        } else if (msgType == MSG_ICON) {
+            // Icon change: deserialize and update launcher console icon
+            HICON hIcon = DeserializeIcon(buffer, totalRead);
+            if (hIcon) {
+                HWND hConsoleWnd = GetConsoleWindow();
+                if (hConsoleWnd) {
+                    SendMessageW(hConsoleWnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+                    SendMessageW(hConsoleWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+                    DebugLog("RunInjectedLoop: Updated console icon from target\n");
+                }
+                // Note: Don't destroy hIcon - the window now owns it
             }
         } else {
             // Normal stdout/stderr output

@@ -25,6 +25,8 @@ static decltype(&LoadLibraryA) g_OriginalLoadLibraryA = nullptr;
 static decltype(&LoadLibraryW) g_OriginalLoadLibraryW = nullptr;
 static decltype(&LoadLibraryExA) g_OriginalLoadLibraryExA = nullptr;
 static decltype(&LoadLibraryExW) g_OriginalLoadLibraryExW = nullptr;
+static decltype(&SetConsoleTitleA) g_OriginalSetConsoleTitleA = nullptr;
+static decltype(&SetConsoleTitleW) g_OriginalSetConsoleTitleW = nullptr;
 
 // Status line attribute (captured from WriteConsoleOutputAttribute)
 static WORD g_statusLineAttrib = FOREGROUND_GREEN | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY;
@@ -38,6 +40,14 @@ static const char MSG_STDOUT = 0x01;
 static const char MSG_STDERR = 0x02;
 static const char MSG_STATUSLINE = 0x03;
 static const char MSG_STATUSLINE_ATTR = 0x04;
+static const char MSG_TITLE = 0x05;
+static const char MSG_ICON = 0x06;
+
+// Console window handle for icon interception
+static HWND g_hTargetConsoleWnd = nullptr;
+
+// Original SendMessageW function pointer
+static decltype(&SendMessageW) g_OriginalSendMessageW = nullptr;
 
 static void SendToPipeWithType(const char* data, DWORD length, char msgType) {
     if (g_hPipeOut == INVALID_HANDLE_VALUE || !g_pipeConnected || length == 0) return;
@@ -60,6 +70,100 @@ static void SendToPipeWithTypeW(const wchar_t* data, DWORD length, char msgType)
         WideCharToMultiByte(CP_UTF8, 0, data, length, &utf8Buf[0], utf8Len, nullptr, nullptr);
         SendToPipeWithType(utf8Buf.data(), utf8Len, msgType);
     }
+}
+
+// Serialize HICON to byte buffer and send to pipe for cross-process icon transfer.
+//
+// Icon Serialization Format (all integers are 4 bytes, little-endian):
+// +--------+--------+-----+----------+----------+-----------+----------+------------+-----------+
+// | width  | height | bpp | xHotspot | yHotspot | colorSize | maskSize | colorBits  | maskBits  |
+// | (4B)   | (4B)   | (4B)| (4B)     | (4B)     | (4B)      | (4B)     | (variable) | (variable)|
+// +--------+--------+-----+----------+----------+-----------+----------+------------+-----------+
+//
+// - width/height: Icon dimensions in pixels
+// - bpp: Bits per pixel of the color bitmap (e.g., 32 for ARGB)
+// - xHotspot/yHotspot: Cursor hotspot (unused for icons, but preserved)
+// - colorSize: Size of color bitmap data in bytes (0 if no color bitmap)
+// - maskSize: Size of mask bitmap data in bytes (0 if no mask bitmap)
+// - colorBits: Raw pixel data of the color bitmap (device-dependent format)
+// - maskBits: Raw pixel data of the AND mask bitmap (1bpp monochrome)
+//
+// The receiver uses CreateDIBSection + CreateBitmap + CreateIconIndirect to reconstruct the icon.
+static void SendIconToPipe(HICON hIcon) {
+    if (!hIcon || hIcon == (HICON)1) return;
+    if (g_hPipeOut == INVALID_HANDLE_VALUE || !g_pipeConnected) return;
+
+    ICONINFO iconInfo;
+    if (!GetIconInfo(hIcon, &iconInfo)) return;
+
+    BITMAP bmpColor = {};
+    BITMAP bmpMask = {};
+    bool hasColor = iconInfo.hbmColor && GetObject(iconInfo.hbmColor, sizeof(BITMAP), &bmpColor);
+    bool hasMask = iconInfo.hbmMask && GetObject(iconInfo.hbmMask, sizeof(BITMAP), &bmpMask);
+
+    if (!hasColor && !hasMask) {
+        if (iconInfo.hbmColor) DeleteObject(iconInfo.hbmColor);
+        if (iconInfo.hbmMask) DeleteObject(iconInfo.hbmMask);
+        return;
+    }
+
+    // Use color bitmap dimensions, or mask if no color
+    int width = hasColor ? bmpColor.bmWidth : bmpMask.bmWidth;
+    int height = hasColor ? bmpColor.bmHeight : bmpMask.bmHeight;
+    int bpp = hasColor ? bmpColor.bmBitsPixel : 1;
+
+    // Calculate bitmap data sizes
+    int colorStride = hasColor ? ((bmpColor.bmWidth * bmpColor.bmBitsPixel + 31) / 32) * 4 : 0;
+    int colorSize = hasColor ? colorStride * bmpColor.bmHeight : 0;
+    int maskStride = hasMask ? ((bmpMask.bmWidth + 31) / 32) * 4 : 0;
+    int maskSize = hasMask ? maskStride * bmpMask.bmHeight : 0;
+
+    // Header: 7 ints (28 bytes) + colorBits + maskBits
+    int headerSize = 7 * sizeof(int);
+    int totalSize = headerSize + colorSize + maskSize;
+
+    char* buffer = new char[totalSize];
+    int* header = reinterpret_cast<int*>(buffer);
+    header[0] = width;
+    header[1] = height;
+    header[2] = bpp;
+    header[3] = (int)iconInfo.xHotspot;
+    header[4] = (int)iconInfo.yHotspot;
+    header[5] = colorSize;
+    header[6] = maskSize;
+
+    // Get bitmap bits
+    if (hasColor && colorSize > 0) {
+        GetBitmapBits(iconInfo.hbmColor, colorSize, buffer + headerSize);
+    }
+    if (hasMask && maskSize > 0) {
+        GetBitmapBits(iconInfo.hbmMask, maskSize, buffer + headerSize + colorSize);
+    }
+
+    SendToPipeWithType(buffer, totalSize, MSG_ICON);
+
+    delete[] buffer;
+    if (iconInfo.hbmColor) DeleteObject(iconInfo.hbmColor);
+    if (iconInfo.hbmMask) DeleteObject(iconInfo.hbmMask);
+}
+
+// Hooked SendMessageW - intercept WM_SETICON sent to console window
+static LRESULT WINAPI HookedSendMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    // Capture WM_SETICON sent to the console window
+    if (Msg == WM_SETICON && hWnd == g_hTargetConsoleWnd && wParam == ICON_BIG) {
+        HICON hIcon = (HICON)lParam;
+        SendIconToPipe(hIcon);
+    }
+
+    // Call original
+    if (g_OriginalSendMessageW) {
+        return g_OriginalSendMessageW(hWnd, Msg, wParam, lParam);
+    }
+    static auto pFunc = (decltype(&SendMessageW))GetProcAddress(GetModuleHandleW(L"user32.dll"), "SendMessageW");
+    if (pFunc) {
+        return pFunc(hWnd, Msg, wParam, lParam);
+    }
+    return 0;
 }
 
 // Hooked WriteConsoleA
@@ -217,6 +321,40 @@ static BOOL WINAPI HookedWriteConsoleOutputAttribute(
     return TRUE;
 }
 
+// Hooked SetConsoleTitleA - intercept title changes
+static BOOL WINAPI HookedSetConsoleTitleA(LPCSTR lpConsoleTitle) {
+    if (lpConsoleTitle) {
+        SendToPipeWithType(lpConsoleTitle, (DWORD)strlen(lpConsoleTitle), MSG_TITLE);
+    }
+
+    // Call original - use saved pointer or get from kernel32 directly
+    if (g_OriginalSetConsoleTitleA) {
+        return g_OriginalSetConsoleTitleA(lpConsoleTitle);
+    }
+    static auto pFunc = (decltype(&SetConsoleTitleA))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetConsoleTitleA");
+    if (pFunc) {
+        return pFunc(lpConsoleTitle);
+    }
+    return TRUE;
+}
+
+// Hooked SetConsoleTitleW - intercept title changes
+static BOOL WINAPI HookedSetConsoleTitleW(LPCWSTR lpConsoleTitle) {
+    if (lpConsoleTitle) {
+        SendToPipeWithTypeW(lpConsoleTitle, (DWORD)wcslen(lpConsoleTitle), MSG_TITLE);
+    }
+
+    // Call original - use saved pointer or get from kernel32 directly
+    if (g_OriginalSetConsoleTitleW) {
+        return g_OriginalSetConsoleTitleW(lpConsoleTitle);
+    }
+    static auto pFunc = (decltype(&SetConsoleTitleW))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetConsoleTitleW");
+    if (pFunc) {
+        return pFunc(lpConsoleTitle);
+    }
+    return TRUE;
+}
+
 // Simple IAT hooking
 static bool HookIAT(HMODULE hModule, const char* dllName, const char* funcName, void* hookFunc, void** origFunc) {
     if (!hModule) hModule = GetModuleHandleW(nullptr);
@@ -277,6 +415,9 @@ static void HookModule(HMODULE hModule) {
     hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputCharacterA", (void*)HookedWriteConsoleOutputCharacterA, nullptr);
     hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputCharacterW", (void*)HookedWriteConsoleOutputCharacterW, nullptr);
     hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputAttribute", (void*)HookedWriteConsoleOutputAttribute, nullptr);
+    hooked |= HookIAT(hModule, "kernel32.dll", "SetConsoleTitleA", (void*)HookedSetConsoleTitleA, nullptr);
+    hooked |= HookIAT(hModule, "kernel32.dll", "SetConsoleTitleW", (void*)HookedSetConsoleTitleW, nullptr);
+    hooked |= HookIAT(hModule, "user32.dll", "SendMessageW", (void*)HookedSendMessageW, nullptr);
 
     if (hooked) {
         char debugBuf[512];
@@ -354,6 +495,19 @@ static void InstallHooks() {
         OutputDebugStringA("[ConsoleHook] Hooked WriteConsoleOutputAttribute in main module\n");
     }
 
+    // Hook SetConsoleTitleA/W for title changes
+    if (HookIAT(hModule, "kernel32.dll", "SetConsoleTitleA", (void*)HookedSetConsoleTitleA, (void**)&g_OriginalSetConsoleTitleA)) {
+        OutputDebugStringA("[ConsoleHook] Hooked SetConsoleTitleA in main module\n");
+    }
+    if (HookIAT(hModule, "kernel32.dll", "SetConsoleTitleW", (void*)HookedSetConsoleTitleW, (void**)&g_OriginalSetConsoleTitleW)) {
+        OutputDebugStringA("[ConsoleHook] Hooked SetConsoleTitleW in main module\n");
+    }
+
+    // Hook SendMessageW for icon changes (user32.dll)
+    if (HookIAT(hModule, "user32.dll", "SendMessageW", (void*)HookedSendMessageW, (void**)&g_OriginalSendMessageW)) {
+        OutputDebugStringA("[ConsoleHook] Hooked SendMessageW in main module\n");
+    }
+
     // Hook LoadLibrary functions to catch dynamically loaded modules
     if (HookIAT(hModule, "kernel32.dll", "LoadLibraryA", (void*)HookedLoadLibraryA, (void**)&g_OriginalLoadLibraryA)) {
         OutputDebugStringA("[ConsoleHook] Hooked LoadLibraryA in main module\n");
@@ -388,6 +542,9 @@ static void InstallHooks() {
                     hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleOutputCharacterA", (void*)HookedWriteConsoleOutputCharacterA, nullptr);
                     hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleOutputCharacterW", (void*)HookedWriteConsoleOutputCharacterW, nullptr);
                     hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleOutputAttribute", (void*)HookedWriteConsoleOutputAttribute, nullptr);
+                    hooked |= HookIAT(hModules[i], "kernel32.dll", "SetConsoleTitleA", (void*)HookedSetConsoleTitleA, nullptr);
+                    hooked |= HookIAT(hModules[i], "kernel32.dll", "SetConsoleTitleW", (void*)HookedSetConsoleTitleW, nullptr);
+                    hooked |= HookIAT(hModules[i], "user32.dll", "SendMessageW", (void*)HookedSendMessageW, nullptr);
                     if (hooked) {
                         sprintf_s(debugBuf, "[ConsoleHook] Hooked module: %s\n", moduleName);
                         OutputDebugStringA(debugBuf);
@@ -527,6 +684,9 @@ static bool Initialize() {
     // Get console handles
     g_hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
     g_hStderr = GetStdHandle(STD_ERROR_HANDLE);
+
+    // Store console window handle for icon interception
+    g_hTargetConsoleWnd = GetConsoleWindow();
 
     // Create named pipes for communication
     // Pipe names include PID for uniqueness
