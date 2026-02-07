@@ -10,13 +10,15 @@ static HANDLE g_hPipeIn = INVALID_HANDLE_VALUE;  // For sending commands to targ
 static bool g_isSourceEngine = false;  // Whether target is Source Engine (srcds)
 
 static void DebugLog(const char* msg) {
-    OutputDebugStringA("[ConsoleForwarder] ");
-    OutputDebugStringA(msg);
+    char buffer[1024];
+    sprintf_s(buffer, "[ConsoleForwarder] %s", msg);
+    OutputDebugStringA(buffer);
 }
 
 static void DebugLogW(const wchar_t* msg) {
-    OutputDebugStringA("[ConsoleForwarder] ");
-    OutputDebugStringW(msg);
+    wchar_t buffer[1024];
+    swprintf_s(buffer, L"[ConsoleForwarder] %s", msg);
+    OutputDebugStringW(buffer);
 }
 
 // Console control handler to gracefully terminate target process
