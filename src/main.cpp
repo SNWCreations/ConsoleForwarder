@@ -65,7 +65,6 @@ int wmain(int argc, wchar_t* argv[]) {
 
     switch (mode) {
     case CaptureMode::ConPTY: {
-        fwprintf(stderr, L"Using ConPTY mode\n");
         ConPTYHandle handle;
         if (!CreateConPTYProcess(options.program, options.args, options.hideWindow, handle)) {
             return 1;
@@ -79,7 +78,6 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     case CaptureMode::Legacy: {
-        fwprintf(stderr, L"Using Legacy console buffer mode\n");
         LegacyConsoleHandle handle;
         if (!CreateLegacyProcess(options.program, options.args, options.hideWindow, handle)) {
             return 1;
@@ -93,8 +91,6 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     case CaptureMode::Inject: {
-        fwprintf(stderr, L"Using DLL injection mode\n");
-
         std::wstring exeDir = GetExecutableDirectory();
         std::wstring dllPath = exeDir + L"\\ConsoleHook.dll";
 
