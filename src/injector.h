@@ -15,4 +15,4 @@ bool CreateInjectedProcess(
     HANDLE& hThread
 );
 
-void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::wstring& program);
+void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::wstring& program, bool hideWindow);

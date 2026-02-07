@@ -114,7 +114,7 @@ int wmain(int argc, wchar_t* argv[]) {
         wchar_t pipeName[64];
         swprintf_s(pipeName, L"ConsoleForwarder_%lu", GetProcessId(hProcess));
 
-        RunInjectedLoop(hProcess, pipeName, options.program);
+        RunInjectedLoop(hProcess, pipeName, options.program, options.hideWindow);
 
         DWORD exitCode = 0;
         GetExitCodeProcess(hProcess, &exitCode);

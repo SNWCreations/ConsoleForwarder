@@ -145,6 +145,41 @@ bool InjectDLL(HANDLE hProcess, const std::wstring& dllPath) {
     return true;
 }
 
+// Find console window for a specific process using window enumeration
+static HWND FindConsoleWindowForProcess(DWORD pid) {
+    // Structure for EnumWindows callback
+    struct FindData {
+        DWORD pid;
+        HWND hwnd;
+    } data = { pid, nullptr };
+
+    // Callback to find console window
+    auto callback = [](HWND hwnd, LPARAM lParam) -> BOOL {
+        FindData* data = reinterpret_cast<FindData*>(lParam);
+        DWORD windowPid = 0;
+        GetWindowThreadProcessId(hwnd, &windowPid);
+        if (windowPid == data->pid) {
+            wchar_t className[256];
+            if (GetClassNameW(hwnd, className, 256)) {
+                if (wcscmp(className, L"ConsoleWindowClass") == 0) {
+                    data->hwnd = hwnd;
+                    return FALSE;
+                }
+            }
+        }
+        return TRUE;
+    };
+
+    for (int i = 0; i < 50; i++) {
+        EnumWindows(callback, reinterpret_cast<LPARAM>(&data));
+        if (data.hwnd) {
+            return data.hwnd;
+        }
+        Sleep(100);
+    }
+    return nullptr;
+}
+
 bool CreateInjectedProcess(
     const std::wstring& program,
     const std::vector<std::wstring>& args,
@@ -169,9 +204,18 @@ bool CreateInjectedProcess(
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
 
+    // Create a hidden desktop to prevent window flash
+    HDESK hHiddenDesktop = nullptr;
     if (hideWindow) {
-        si.dwFlags |= STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
+        hHiddenDesktop = CreateDesktopW(L"ConsoleForwarderHidden", nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+        if (hHiddenDesktop) {
+            si.lpDesktop = const_cast<LPWSTR>(L"ConsoleForwarderHidden");
+            DebugLog("CreateInjectedProcess: Using hidden desktop\n");
+        } else {
+            DebugLog("CreateInjectedProcess: Failed to create hidden desktop, falling back to SW_HIDE\n");
+            si.dwFlags |= STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+        }
     }
 
     PROCESS_INFORMATION pi = {};
@@ -194,6 +238,7 @@ bool CreateInjectedProcess(
     if (!success) {
         DebugLog("CreateInjectedProcess: CreateProcessW failed\n");
         fwprintf(stderr, L"Failed to create process: %lu\n", GetLastError());
+        if (hHiddenDesktop) CloseDesktop(hHiddenDesktop);
         return false;
     }
 
@@ -207,12 +252,16 @@ bool CreateInjectedProcess(
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        if (hHiddenDesktop) CloseDesktop(hHiddenDesktop);
         return false;
     }
 
     // Resume the process
     DebugLog("CreateInjectedProcess: Resuming process\n");
     ResumeThread(pi.hThread);
+
+    // Close hidden desktop handle (process keeps reference)
+    if (hHiddenDesktop) CloseDesktop(hHiddenDesktop);
 
     hProcess = pi.hProcess;
     hThread = pi.hThread;
@@ -250,7 +299,9 @@ static void StdinForwardThread(HANDLE hPipe) {
     DebugLog("StdinForwardThread: Exiting\n");
 }
 
-void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::wstring& program) {
+void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::wstring& program, bool hideWindow) {
+    (void)hideWindow; // No longer needed - hidden desktop handles this
+
     g_InjectedRunning = true;
 
     // Store process info for console control handler
