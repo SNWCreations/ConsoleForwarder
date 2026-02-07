@@ -389,8 +389,29 @@ void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::w
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
     HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
 
+    // Check if stdout is a TTY (for status line display)
+    DWORD consoleMode;
+    bool isTTY = GetConsoleMode(hStdout, &consoleMode) != 0;
+    bool statusLineEnabled = false;
+
+    if (isTTY) {
+        DebugLog("RunInjectedLoop: stdout is TTY, status line enabled\n");
+        statusLineEnabled = true;
+    } else {
+        DebugLog("RunInjectedLoop: stdout is not TTY, status line disabled\n");
+    }
+
     // Start stdin forwarding thread (writes to input pipe)
     std::thread stdinThread(StdinForwardThread, hPipeIn);
+
+    // Message types
+    const char MSG_STDOUT = 0x01;
+    const char MSG_STDERR = 0x02;
+    const char MSG_STATUSLINE = 0x03;
+    const char MSG_STATUSLINE_ATTR = 0x04;
+
+    // Status line attribute (default: bright green on white, like srcds)
+    WORD statusLineAttrib = FOREGROUND_GREEN | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY;
 
     // Read from output pipe and write to stdout/stderr based on message type
     // Protocol: [type:1byte][length:4bytes][data:length bytes]
@@ -417,20 +438,55 @@ void RunInjectedLoop(HANDLE hProcess, const std::wstring& pipeName, const std::w
         // Read message data
         DWORD totalRead = 0;
         while (totalRead < msgLen) {
-            DWORD toRead = min(msgLen - totalRead, (DWORD)sizeof(buffer));
-            if (!ReadFile(hPipeOut, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+            DWORD toRead = min(msgLen - totalRead, (DWORD)sizeof(buffer) - 1);
+            if (!ReadFile(hPipeOut, buffer + totalRead, toRead, &bytesRead, nullptr) || bytesRead == 0) {
                 DebugLog("RunInjectedLoop: ReadFile (data) failed\n");
                 break;
             }
-
-            // Write to appropriate handle
-            HANDLE hOutput = (msgType == 0x02) ? hStderr : hStdout;
-            DWORD bytesWritten;
-            WriteFile(hOutput, buffer, bytesRead, &bytesWritten, nullptr);
             totalRead += bytesRead;
         }
 
         if (totalRead < msgLen) break;
+
+        // Handle message based on type
+        if (msgType == MSG_STATUSLINE_ATTR) {
+            // Status line attribute: store for later use
+            if (totalRead >= sizeof(WORD)) {
+                statusLineAttrib = *reinterpret_cast<WORD*>(buffer);
+            }
+        } else if (msgType == MSG_STATUSLINE) {
+            // Status line: only display if TTY and status line is enabled
+            if (statusLineEnabled) {
+                buffer[totalRead] = '\0';
+                // Use Windows Console API to write directly to buffer position (0,0)
+                // This matches srcds behavior - status line at the top of the buffer
+                COORD coord = { 0, 0 };
+                DWORD written;
+
+                // Pad the status line to 80 characters (like srcds)
+                char paddedStatus[81];
+                int statusLen = (int)strlen(buffer);
+                if (statusLen > 80) statusLen = 80;
+                memcpy(paddedStatus, buffer, statusLen);
+                memset(paddedStatus + statusLen, ' ', 80 - statusLen);
+                paddedStatus[80] = '\0';
+
+                // Write the status line text at position (0,0)
+                WriteConsoleOutputCharacterA(hStdout, paddedStatus, 80, coord, &written);
+
+                // Write the attributes (color) at position (0,0)
+                WORD attribs[80];
+                for (int i = 0; i < 80; i++) {
+                    attribs[i] = statusLineAttrib;
+                }
+                WriteConsoleOutputAttribute(hStdout, attribs, 80, coord, &written);
+            }
+        } else {
+            // Normal stdout/stderr output
+            HANDLE hOutput = (msgType == MSG_STDERR) ? hStderr : hStdout;
+            DWORD bytesWritten;
+            WriteFile(hOutput, buffer, totalRead, &bytesWritten, nullptr);
+        }
     }
 
     DebugLog("RunInjectedLoop: Loop ended, cleaning up\n");

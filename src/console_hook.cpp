@@ -18,10 +18,16 @@ static bool g_stdinRunning = false;
 static decltype(&WriteConsoleA) g_OriginalWriteConsoleA = nullptr;
 static decltype(&WriteConsoleW) g_OriginalWriteConsoleW = nullptr;
 static decltype(&WriteFile) g_OriginalWriteFile = nullptr;
+static decltype(&WriteConsoleOutputCharacterA) g_OriginalWriteConsoleOutputCharacterA = nullptr;
+static decltype(&WriteConsoleOutputCharacterW) g_OriginalWriteConsoleOutputCharacterW = nullptr;
+static decltype(&WriteConsoleOutputAttribute) g_OriginalWriteConsoleOutputAttribute = nullptr;
 static decltype(&LoadLibraryA) g_OriginalLoadLibraryA = nullptr;
 static decltype(&LoadLibraryW) g_OriginalLoadLibraryW = nullptr;
 static decltype(&LoadLibraryExA) g_OriginalLoadLibraryExA = nullptr;
 static decltype(&LoadLibraryExW) g_OriginalLoadLibraryExW = nullptr;
+
+// Status line attribute (captured from WriteConsoleOutputAttribute)
+static WORD g_statusLineAttrib = FOREGROUND_GREEN | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY;
 
 // Console handles to intercept
 static HANDLE g_hStdout = INVALID_HANDLE_VALUE;
@@ -30,6 +36,8 @@ static HANDLE g_hStderr = INVALID_HANDLE_VALUE;
 // Message types for pipe protocol
 static const char MSG_STDOUT = 0x01;
 static const char MSG_STDERR = 0x02;
+static const char MSG_STATUSLINE = 0x03;
+static const char MSG_STATUSLINE_ATTR = 0x04;
 
 static void SendToPipeWithType(const char* data, DWORD length, char msgType) {
     if (g_hPipeOut == INVALID_HANDLE_VALUE || !g_pipeConnected || length == 0) return;
@@ -129,6 +137,86 @@ static BOOL WINAPI HookedWriteFile(
     return FALSE;
 }
 
+// Hooked WriteConsoleOutputCharacterA - intercept status line writes
+static BOOL WINAPI HookedWriteConsoleOutputCharacterA(
+    HANDLE hConsoleOutput,
+    LPCSTR lpCharacter,
+    DWORD nLength,
+    COORD dwWriteCoord,
+    LPDWORD lpNumberOfCharsWritten
+) {
+    // Check if writing to the first line (status line)
+    if (dwWriteCoord.Y == 0) {
+        SendToPipeWithType(lpCharacter, nLength, MSG_STATUSLINE);
+    }
+
+    // Call original - use saved pointer or get from kernel32 directly
+    if (g_OriginalWriteConsoleOutputCharacterA) {
+        return g_OriginalWriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+    }
+    // Fallback: get the function directly from kernel32
+    static auto pFunc = (decltype(&WriteConsoleOutputCharacterA))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "WriteConsoleOutputCharacterA");
+    if (pFunc) {
+        return pFunc(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+    }
+    if (lpNumberOfCharsWritten) *lpNumberOfCharsWritten = nLength;
+    return TRUE;
+}
+
+// Hooked WriteConsoleOutputCharacterW - intercept status line writes
+static BOOL WINAPI HookedWriteConsoleOutputCharacterW(
+    HANDLE hConsoleOutput,
+    LPCWSTR lpCharacter,
+    DWORD nLength,
+    COORD dwWriteCoord,
+    LPDWORD lpNumberOfCharsWritten
+) {
+    // Check if writing to the first line (status line)
+    if (dwWriteCoord.Y == 0) {
+        SendToPipeWithTypeW(lpCharacter, nLength, MSG_STATUSLINE);
+    }
+
+    // Call original - use saved pointer or get from kernel32 directly
+    if (g_OriginalWriteConsoleOutputCharacterW) {
+        return g_OriginalWriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+    }
+    // Fallback: get the function directly from kernel32
+    static auto pFunc = (decltype(&WriteConsoleOutputCharacterW))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "WriteConsoleOutputCharacterW");
+    if (pFunc) {
+        return pFunc(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+    }
+    if (lpNumberOfCharsWritten) *lpNumberOfCharsWritten = nLength;
+    return TRUE;
+}
+
+// Hooked WriteConsoleOutputAttribute - intercept status line color
+static BOOL WINAPI HookedWriteConsoleOutputAttribute(
+    HANDLE hConsoleOutput,
+    const WORD* lpAttribute,
+    DWORD nLength,
+    COORD dwWriteCoord,
+    LPDWORD lpNumberOfAttrsWritten
+) {
+    // Check if writing to the first line (status line)
+    if (dwWriteCoord.Y == 0 && nLength > 0 && lpAttribute) {
+        // Capture the attribute and send to pipe
+        g_statusLineAttrib = lpAttribute[0];
+        SendToPipeWithType((const char*)&g_statusLineAttrib, sizeof(WORD), MSG_STATUSLINE_ATTR);
+    }
+
+    // Call original - use saved pointer or get from kernel32 directly
+    if (g_OriginalWriteConsoleOutputAttribute) {
+        return g_OriginalWriteConsoleOutputAttribute(hConsoleOutput, lpAttribute, nLength, dwWriteCoord, lpNumberOfAttrsWritten);
+    }
+    // Fallback: get the function directly from kernel32
+    static auto pFunc = (decltype(&WriteConsoleOutputAttribute))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "WriteConsoleOutputAttribute");
+    if (pFunc) {
+        return pFunc(hConsoleOutput, lpAttribute, nLength, dwWriteCoord, lpNumberOfAttrsWritten);
+    }
+    if (lpNumberOfAttrsWritten) *lpNumberOfAttrsWritten = nLength;
+    return TRUE;
+}
+
 // Simple IAT hooking
 static bool HookIAT(HMODULE hModule, const char* dllName, const char* funcName, void* hookFunc, void** origFunc) {
     if (!hModule) hModule = GetModuleHandleW(nullptr);
@@ -186,6 +274,9 @@ static void HookModule(HMODULE hModule) {
     hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleA", (void*)HookedWriteConsoleA, nullptr);
     hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleW", (void*)HookedWriteConsoleW, nullptr);
     hooked |= HookIAT(hModule, "kernel32.dll", "WriteFile", (void*)HookedWriteFile, nullptr);
+    hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputCharacterA", (void*)HookedWriteConsoleOutputCharacterA, nullptr);
+    hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputCharacterW", (void*)HookedWriteConsoleOutputCharacterW, nullptr);
+    hooked |= HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputAttribute", (void*)HookedWriteConsoleOutputAttribute, nullptr);
 
     if (hooked) {
         char debugBuf[512];
@@ -250,6 +341,19 @@ static void InstallHooks() {
         OutputDebugStringA("[ConsoleHook] Hooked WriteFile in main module\n");
     }
 
+    // Hook WriteConsoleOutputCharacterA/W for status line
+    if (HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputCharacterA", (void*)HookedWriteConsoleOutputCharacterA, (void**)&g_OriginalWriteConsoleOutputCharacterA)) {
+        OutputDebugStringA("[ConsoleHook] Hooked WriteConsoleOutputCharacterA in main module\n");
+    }
+    if (HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputCharacterW", (void*)HookedWriteConsoleOutputCharacterW, (void**)&g_OriginalWriteConsoleOutputCharacterW)) {
+        OutputDebugStringA("[ConsoleHook] Hooked WriteConsoleOutputCharacterW in main module\n");
+    }
+
+    // Hook WriteConsoleOutputAttribute for status line color
+    if (HookIAT(hModule, "kernel32.dll", "WriteConsoleOutputAttribute", (void*)HookedWriteConsoleOutputAttribute, (void**)&g_OriginalWriteConsoleOutputAttribute)) {
+        OutputDebugStringA("[ConsoleHook] Hooked WriteConsoleOutputAttribute in main module\n");
+    }
+
     // Hook LoadLibrary functions to catch dynamically loaded modules
     if (HookIAT(hModule, "kernel32.dll", "LoadLibraryA", (void*)HookedLoadLibraryA, (void**)&g_OriginalLoadLibraryA)) {
         OutputDebugStringA("[ConsoleHook] Hooked LoadLibraryA in main module\n");
@@ -281,6 +385,9 @@ static void InstallHooks() {
                     hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleA", (void*)HookedWriteConsoleA, nullptr);
                     hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleW", (void*)HookedWriteConsoleW, nullptr);
                     hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteFile", (void*)HookedWriteFile, nullptr);
+                    hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleOutputCharacterA", (void*)HookedWriteConsoleOutputCharacterA, nullptr);
+                    hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleOutputCharacterW", (void*)HookedWriteConsoleOutputCharacterW, nullptr);
+                    hooked |= HookIAT(hModules[i], "kernel32.dll", "WriteConsoleOutputAttribute", (void*)HookedWriteConsoleOutputAttribute, nullptr);
                     if (hooked) {
                         sprintf_s(debugBuf, "[ConsoleHook] Hooked module: %s\n", moduleName);
                         OutputDebugStringA(debugBuf);
